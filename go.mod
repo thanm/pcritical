@@ -1,4 +1,4 @@
-module pgraph
+module pcritical
 
 go 1.20
 
