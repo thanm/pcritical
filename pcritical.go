@@ -19,6 +19,7 @@ import (
 //   + do an initial "go list -json" on tgt to see if stdlib or no
 //   + calculate glo (cache key) based on goroot hash and cur dir hash
 //   + don't change to goroot each time for go list
+// - add option to screen out stdlib packages altogether
 // - add build timings (might need to defeat build cache)
 // - do "go list" and package size calculations in parallel
 
