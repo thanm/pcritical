@@ -15,14 +15,17 @@ import (
 )
 
 // TODO/FIXME:
-// - don't emit entire DOT, just critical path itself, or possibly
-//   a small set of critical paths
+// - rewrite to handle import paths outside stdlib
+//   + do an initial "go list -json" on tgt to see if stdlib or no
+//   + calculate glo (cache key) based on goroot hash and cur dir hash
+//   + don't change to goroot each time for go list
 // - add build timings (might need to defeat build cache)
 // - do "go list" and package size calculations in parallel
 
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var glcacheflag = flag.String("glcache", "/tmp/.glcache", "cache dir for 'go list' invocations")
 var tgtflag = flag.String("tgt", "cmd/buildid", "target to analyze")
+var topnflag = flag.Int("topn", 3, "generate DOT graph with top N paths")
 
 // Pkg holds results from "go list -json". There are many more
 // fields we could ask for, but at the moment import path is all
@@ -158,6 +161,13 @@ func goList(dir, goroot string) (*Pkg, error) {
 	return &pkg, nil
 }
 
+func (g *pgraph) nidPkgSize(nid string) int {
+	nlab := g.LookupNode(nid).Label()
+	pkg := nlab[1 : len(nlab)-1]
+	sz, _ := pkgSize(pkg, g.goroot)
+	return sz
+}
+
 func pkgSize(dir, goroot string) (int, error) {
 	// Try cache first
 	out, valid, err := tryCache(dir, "build")
@@ -203,8 +213,9 @@ func goRoot() (string, error) {
 }
 
 func nodeAttr(n string) map[string]string {
+	qu := "\""
 	return map[string]string{
-		"label": n,
+		"label": qu + n + qu,
 	}
 }
 
@@ -319,11 +330,64 @@ type pathsegment struct {
 	wt  int
 }
 
-// markCriticalPath picks out a critical path in the graph, prints it
+func traceCritical(g *pgraph, rootnid, mptn string, nodes []string, included map[string]bool) error {
+	// paint the critical path starting at mptn
+	included[rootnid] = true
+	cp := []pathsegment{
+		pathsegment{
+			nid: mptn,
+			pkg: g.LookupNode(mptn).Label(),
+			wt:  0,
+		}}
+	cur := mptn
+	for cur != rootnid {
+		included[cur] = true
+		// Look at in-edges.
+		n := g.LookupNode(cur)
+		bestweight := 0
+		var bestpred uint32
+		edges := g.GetInEdges(n)
+		if len(edges) == 0 {
+			return fmt.Errorf("internal error: no-preds node %s", cur)
+		}
+		for _, e := range edges {
+			edge := g.GetEdge(e)
+			src, _ := g.GetEndpoints(edge)
+			wt, werr := g.EdgeWeight(edge)
+			if werr != nil {
+				return werr
+			}
+			if wt > bestweight {
+				bestpred = src
+				bestweight = wt
+			}
+		}
+		if bestweight == 0 {
+			panic("unexpected")
+		}
+		ps := pathsegment{
+			nid: g.GetNode(bestpred).Id(),
+			pkg: g.GetNode(bestpred).Label(),
+			wt:  bestweight,
+		}
+		cp = append(cp, ps)
+		cur = g.GetNode(bestpred).Id()
+	}
+
+	verb(0, "\nCritical path:")
+	for i := range cp {
+		seg := cp[i]
+		sz := g.nidPkgSize(seg.nid)
+		verb(0, "%s [wt:%d]", seg.pkg, sz)
+	}
+	return nil
+}
+
+// markCriticalPaths picks out N critical paths in the graph, prints them
 // out, and updates the graph edge attributes. This version uses
 // weighted edges, where the weight from X->Y is considered to be the
 // estimated build time of Y.
-func markCriticalPath(g *pgraph, nid string) error {
+func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 	listing := topsort(g, nid)
 
 	verb(2, "topsorted listing: %+v", listing)
@@ -355,82 +419,48 @@ func markCriticalPath(g *pgraph, nid string) error {
 		pathto[v] = toval
 	}
 
-	// Sort nodes by pathto, collect max pathto
-	mpt := 0
-	mptn := ""
+	// Sort nodes by pathto.
 	nodes := make([]string, 0, len(pathto))
-	for k, v := range pathto {
-		if v > mpt {
-			mpt = v
-			mptn = k
-		}
+	for k := range pathto {
 		nodes = append(nodes, k)
 	}
-	verb(2, "maxpathto: node %s weight %d", mptn, mpt)
-
-	// Sort by pathto
 	sort.SliceStable(nodes,
 		func(i, j int) bool {
 			di := pathto[nodes[i]]
 			dj := pathto[nodes[j]]
 			return di < dj
 		})
+
 	// Print for debugging
 	verb(1, "nodes with pathto values:")
 	for k, v := range nodes {
-		sz, _ := pkgSize(v, g.goroot)
+		sz := g.nidPkgSize(v)
 		verb(1, "%d: %s sz=%d pt=%d", k, v, sz, pathto[v])
 	}
 
-	// paint the critical path
-	cp := []pathsegment{
-		pathsegment{
-			nid: mptn,
-			pkg: g.LookupNode(mptn).Label(),
-			wt:  0,
-		}}
-	cur := mptn
-	for cur != nid {
-		// Look at in-edges.
-		n := g.LookupNode(cur)
-		bestweight := 0
-		var bestpred uint32
-		edges := g.GetInEdges(n)
-		if len(edges) == 0 {
-			panic("unexpected no-preds")
+	for i := 0; i < *topnflag && i < len(nodes); i++ {
+		cnidx := len(nodes) - i - 1
+		cnid := nodes[cnidx]
+		if included[cnid] {
+			continue
 		}
-		for _, e := range edges {
-			edge := g.GetEdge(e)
-			src, _ := g.GetEndpoints(edge)
-			wt, werr := g.EdgeWeight(edge)
-			if werr != nil {
-				return werr
-			}
-			if wt > bestweight {
-				bestpred = src
-				bestweight = wt
-			}
-		}
-		if bestweight == 0 {
-			panic("unexpected")
-		}
-		ps := pathsegment{
-			nid: g.GetNode(bestpred).Id(),
-			pkg: g.GetNode(bestpred).Label(),
-			wt:  bestweight,
-		}
-		cp = append(cp, ps)
-		cur = g.GetNode(bestpred).Id()
-	}
-
-	verb(0, "\nCritical path:")
-	for i := range cp {
-		seg := cp[i]
-		sz, _ := pkgSize(seg.pkg, g.goroot)
-		verb(0, "%s [wt:%d]", seg.pkg, sz)
+		verb(1, "traceCritical(root=%s nid=%s)\n", nid, cnid)
+		traceCritical(g, nid, cnid, nodes, included)
 	}
 
 	return nil
+}
+
+func nidToId(g *pgraph, m map[string]bool) map[uint32]bool {
+	res := make(map[uint32]bool)
+	for k := range m {
+		node := g.LookupNode(k)
+		if node == nil {
+			panic("nil node in nidToId")
+		}
+		res[node.Idx()] = true
+	}
+	return res
 }
 
 func verb(vlevel int, s string, a ...interface{}) {
@@ -477,11 +507,12 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
-	if err := markCriticalPath(g, nid); err != nil {
+	included := make(map[string]bool)
+	if err := markCriticalPaths(g, nid, included); err != nil {
 		log.Fatal(err)
 	}
 	gt := g.transpose()
-	if err := gt.Write(outf, nil); err != nil {
+	if err := gt.Write(outf, nidToId(g, included)); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", g.String())
