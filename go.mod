@@ -1,4 +1,4 @@
-module pcritical
+module github.com/thanm/pcritical
 
 go 1.20
 

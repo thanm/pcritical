@@ -15,32 +15,40 @@ import (
 )
 
 // TODO/FIXME:
-// - rewrite to handle import paths outside stdlib
-//   + do an initial "go list -json" on tgt to see if stdlib or no
-//   + calculate glo (cache key) based on goroot hash and cur dir hash
-//   + don't change to goroot each time for go list
-// - add option to screen out stdlib packages altogether
+// - add package staleness check
 // - add build timings (might need to defeat build cache)
-// - do "go list" and package size calculations in parallel
+// - do "go list" and package size calculations in parallel,
+//   and/or deps in parallel
 
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var glcacheflag = flag.String("glcache", "/tmp/.glcache", "cache dir for 'go list' invocations")
 var tgtflag = flag.String("tgt", "cmd/buildid", "target to analyze")
-var topnflag = flag.Int("topn", 3, "generate DOT graph with top N paths")
+var dotoutflag = flag.String("dotout", "tmp.dot", "DOT file to emit")
+var nostdflag = flag.Bool("nostd", false, "Ignore stdlib package deps")
 
 // Pkg holds results from "go list -json". There are many more
-// fields we could ask for, but at the moment import path is all
-// we need.
+// fields we could ask for, but at the moment we just need a few.
 type Pkg struct {
+	Standard   bool
 	ImportPath string
+	Root       string
 	Imports    []string
 }
 
-var curglo string
+var goroothash string
+var repohash string
 
-func glo(goroot string) string {
+func glo(repo string, soft bool) string {
+	if soft {
+		// Don't fail if no .git, just return path.
+		gp := filepath.Join(repo, ".git")
+		_, err := os.ReadDir(gp)
+		if os.IsNotExist(err) {
+			return repo
+		}
+	}
 	cmd := exec.Command("git", "log", "-1", "--oneline")
-	cmd.Dir = goroot
+	cmd.Dir = repo
 	out, err := cmd.Output()
 	if err != nil {
 		log.Fatalf("error running git log -1 --oneline: %v", err)
@@ -56,7 +64,7 @@ func initCache() error {
 	if err != nil {
 		return fmt.Errorf("opening %s: %v", p, err)
 	}
-	if _, err := fmt.Fprintf(outf, "%s\n", curglo); err != nil {
+	if _, err := fmt.Fprintf(outf, "%s %s\n", repohash, goroothash); err != nil {
 		return fmt.Errorf("writing %s: %v", p, err)
 	}
 	if err := outf.Close(); err != nil {
@@ -76,8 +84,9 @@ func cacheValid() (bool, error) {
 		}
 	}
 	val := strings.TrimSpace(string(contents))
-	if val != curglo {
-		verb(2, "cache mismatch:\ngot %q\nwant %q\n", val, curglo)
+	want := repohash + " " + goroothash
+	if val != want {
+		verb(2, "cache mismatch:\ngot %q\nwant %q\n", val, want)
 		if err := os.RemoveAll(*glcacheflag); err != nil {
 			return false, err
 		}
@@ -135,7 +144,7 @@ func writeCache(dir, tag string, content []byte) error {
 	return nil
 }
 
-func goList(dir, goroot string) (*Pkg, error) {
+func goList(dir string) (*Pkg, error) {
 	// Try cache first
 	var pkg Pkg
 	out, valid, err := tryCache(dir, "list")
@@ -143,23 +152,39 @@ func goList(dir, goroot string) (*Pkg, error) {
 		return nil, err
 	} else if !valid {
 		// cache miss, run "go list"
-		ppath := filepath.Join(goroot, dir)
-		cmd := exec.Command("go", "list", "-json", ppath)
-		cmd.Dir = ppath
-		out, err = cmd.Output()
+		pk, out, err := goListUncached(dir, "")
 		if err != nil {
-			return nil, fmt.Errorf("go list -json %s: %v", dir, err)
+			return nil, err
 		}
 		// write back to cache
 		if err := writeCache(dir, "list", out); err != nil {
 			return nil, fmt.Errorf("writing cache: %v", err)
 		}
+		return pk, nil
 	}
 	// unpack
 	if err := json.Unmarshal(out, &pkg); err != nil {
 		return nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
 	}
 	return &pkg, nil
+}
+
+func goListUncached(tgt, dir string) (*Pkg, []byte, error) {
+	// run "go list"
+	cmd := exec.Command("go", "list", "-json", tgt)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("go list -json %s: %v", dir, err)
+	}
+	// unpack
+	var pkg Pkg
+	if err := json.Unmarshal(out, &pkg); err != nil {
+		return nil, nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
+	}
+	return &pkg, out, nil
 }
 
 func (g *pgraph) nidPkgSize(nid string) int {
@@ -176,11 +201,10 @@ func pkgSize(dir, goroot string) (int, error) {
 		return 0, err
 	} else if !valid {
 		// cache miss, run "go build"
-		ppath := filepath.Join(goroot, dir)
 		outfile := cachePath(dir, "archive")
 		os.RemoveAll(outfile)
-		cmd := exec.Command("go", "build", "-o", outfile, ppath)
-		cmd.Dir = ppath
+		verb(2, "build cmd is 'go build -o %s %s", outfile, dir)
+		cmd := exec.Command("go", "build", "-o", outfile, dir)
 		out, err = cmd.CombinedOutput()
 		if err != nil {
 			return 0, fmt.Errorf("go build %s: %v", dir, err)
@@ -275,8 +299,8 @@ func (g *pgraph) snid(n string) string {
 	return fmt.Sprintf("N%d", g.nid(n))
 }
 
-func popNode(tgt string, g *pgraph) (string, error) {
-	verb(2, "=-= popNode(%s)", tgt)
+func populateNode(tgt string, g *pgraph) (string, error) {
+	verb(2, "=-= populateNode(%s)", tgt)
 	if _, ok := g.nodes[tgt]; ok {
 		panic("bad")
 	}
@@ -287,16 +311,25 @@ func popNode(tgt string, g *pgraph) (string, error) {
 		return snid, err
 	}
 	// add edges to deps
-	pk, err := goList(tgt, g.goroot)
+	pk, err := goList(tgt)
 	if err != nil {
 		return snid, err
 	}
 	for _, dep := range pk.Imports {
-		if dep == "unsafe" || dep == "errors" || dep == "tgt" {
+		if dep == "unsafe" {
 			continue
 		}
+		if *nostdflag {
+			pk, err := goList(dep)
+			if err != nil {
+				return snid, err
+			}
+			if pk.Standard {
+				continue
+			}
+		}
 		if _, ok := g.nodes[dep]; !ok {
-			if _, err := popNode(dep, g); err != nil {
+			if _, err := populateNode(dep, g); err != nil {
 				return snid, err
 			}
 		}
@@ -307,7 +340,6 @@ func popNode(tgt string, g *pgraph) (string, error) {
 		}
 		ws := fmt.Sprintf("%d", weight)
 		attrs := map[string]string{
-			//"weight": ws,
 			"label": ws,
 		}
 		g.AddEdge(snid, g.snid(dep), attrs)
@@ -331,55 +363,66 @@ type pathsegment struct {
 	wt  int
 }
 
-func traceCritical(g *pgraph, rootnid, mptn string, nodes []string, included map[string]bool) error {
-	// paint the critical path starting at mptn
+func traceCritical(g *pgraph, rootnid string, nodes []string, included map[string]bool, pathto map[string]int) error {
+	// paint the critical path starting at root
 	included[rootnid] = true
 	cp := []pathsegment{
 		pathsegment{
-			nid: mptn,
-			pkg: g.LookupNode(mptn).Label(),
+			nid: rootnid,
+			pkg: g.LookupNode(rootnid).Label(),
 			wt:  0,
 		}}
-	cur := mptn
-	for cur != rootnid {
+	cur := rootnid
+	for {
 		included[cur] = true
-		// Look at in-edges.
+		// Look at out-edges.
 		n := g.LookupNode(cur)
-		bestweight := 0
-		var bestpred uint32
-		edges := g.GetInEdges(n)
+		edges := g.GetEdges(n)
 		if len(edges) == 0 {
-			return fmt.Errorf("internal error: no-preds node %s", cur)
+			break
 		}
+		var bestsucc string
+		var bestpt int
+		var bestwt int
+		var attrs map[string]string
 		for _, e := range edges {
 			edge := g.GetEdge(e)
-			src, _ := g.GetEndpoints(edge)
+			_, sink := g.GetEndpoints(edge)
+			sinknid := g.GetNode(sink).Id()
+			sinkpt := pathto[sinknid]
 			wt, werr := g.EdgeWeight(edge)
 			if werr != nil {
 				return werr
 			}
-			if wt > bestweight {
-				bestpred = src
-				bestweight = wt
+			if bestpt < sinkpt {
+				bestpt = sinkpt
+				bestsucc = sinknid
+				bestwt = wt
+				attrs = g.GetEdgeAttrs(edge)
 			}
 		}
-		if bestweight == 0 {
+		if bestpt == 0 {
 			panic("unexpected")
 		}
+		// paint edge
+		attrs["color"] = "red"
+		g.SetEdgeAttrs(n.Id(), bestsucc, attrs)
+		// add segment
 		ps := pathsegment{
-			nid: g.GetNode(bestpred).Id(),
-			pkg: g.GetNode(bestpred).Label(),
-			wt:  bestweight,
+			nid: bestsucc,
+			pkg: g.LookupNode(bestsucc).Label(),
+			wt:  bestwt,
 		}
 		cp = append(cp, ps)
-		cur = g.GetNode(bestpred).Id()
+		cur = g.LookupNode(bestsucc).Id()
 	}
 
 	verb(0, "\nCritical path:")
 	for i := range cp {
 		seg := cp[i]
 		sz := g.nidPkgSize(seg.nid)
-		verb(0, "%s [wt:%d]", seg.pkg, sz)
+		pt := pathto[seg.nid]
+		verb(0, "%s [weight:%d pathto:%d]", seg.pkg, sz, pt)
 	}
 	return nil
 }
@@ -394,30 +437,30 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 	verb(2, "topsorted listing: %+v", listing)
 
 	pathto := make(map[string]int)
-	for _, v := range listing {
-		verb(2, "start walk of %s %s", v, g.LookupNode(v).Label())
-		toval := pathto[v]
-		n := g.LookupNode(v)
+	for _, nid := range listing {
+		pathto[nid] = g.nidPkgSize(nid)
+	}
+	for k := range listing {
+		nid := listing[len(listing)-k-1]
+		n := g.LookupNode(nid)
+		verb(2, "start walk of %s %s", nid, n.Label())
+		toval := pathto[nid]
 		edges := g.GetInEdges(n)
 		for _, e := range edges {
 			edge := g.GetEdge(e)
-			src, sink := g.GetEndpoints(edge)
-			verb(2, "consider edge %d:%d %s -> %s",
-				src, sink, g.GetNode(src).Label(), g.GetNode(sink).Label())
-			sn := g.GetNode(src)
-			srcnid := sn.Id()
-			wt, werr := g.EdgeWeight(edge)
-			if werr != nil {
-				return werr
-			}
-			srcval := pathto[srcnid] + wt
-			if srcval > toval {
-				verb(2, "update toval for %s to %d (edge from %s)",
-					n.Label(), srcval, sn.Label())
-				toval = srcval
+			src, _ := g.GetEndpoints(edge)
+			srcnode := g.GetNode(src)
+			srcnid := srcnode.Id()
+			verb(2, "consider edge %s -> %s",
+				g.GetNode(src).Label(), n.Label())
+			srcwt := g.nidPkgSize(srcnid)
+			npt := toval + srcwt
+			if pathto[srcnid] < npt {
+				verb(2, "update pathto[%s] to %d (edge to %s)",
+					srcnode.Label(), npt, n.Label())
+				pathto[srcnid] = npt
 			}
 		}
-		pathto[v] = toval
 	}
 
 	// Sort nodes by pathto.
@@ -429,25 +472,19 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 		func(i, j int) bool {
 			di := pathto[nodes[i]]
 			dj := pathto[nodes[j]]
-			return di < dj
+			return dj < di
 		})
 
 	// Print for debugging
 	verb(1, "nodes with pathto values:")
 	for k, v := range nodes {
 		sz := g.nidPkgSize(v)
-		verb(1, "%d: %s sz=%d pt=%d", k, v, sz, pathto[v])
+		nlab := g.LookupNode(v).Label()
+		verb(1, "%d: %s sz=%d pt=%d %s", k, v, sz, pathto[v], nlab)
 	}
 
-	for i := 0; i < *topnflag && i < len(nodes); i++ {
-		cnidx := len(nodes) - i - 1
-		cnid := nodes[cnidx]
-		if included[cnid] {
-			continue
-		}
-		verb(1, "traceCritical(root=%s nid=%s)\n", nid, cnid)
-		traceCritical(g, nid, cnid, nodes, included)
-	}
+	// trace critical path
+	traceCritical(g, nid, nodes, included, pathto)
 
 	return nil
 }
@@ -483,23 +520,50 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("pcritical: ")
 	flag.Parse()
-	target := *tgtflag
+
+	// Collect GOROOT as a first step.
 	gr, err := goRoot()
+	verb(1, "GOROOT is %s", gr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	curglo = glo(gr)
-	verb(2, "glo: %s", curglo)
+
+	// Run "go list" on the target without any caching, just so that
+	// we can establish some basics.
+	target := *tgtflag
+	verb(1, "target is: %s", *tgtflag)
+	pk, _, err := goListUncached(target, "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	verb(2, "pkg: %+v", *pk)
+
+	// Examine goroot, collect current git hash if applicable.
+	goroothash = glo(gr, true)
+	verb(2, "goroothash: %s", goroothash)
+
+	if pk.Root == gr {
+		// If pk root is the same as target root, we're analyzing something
+		// in the standard library, so repo hash is goroot hash.
+		repohash = goroothash
+	} else {
+		// Collect separate hash from repo.
+		repohash = glo(pk.Root, false)
+		verb(2, "repohash: %s", repohash)
+	}
+
+	// Construct dependency graph.
 	g := &pgraph{
 		Graph:  zgr.NewGraph(),
 		nodes:  make(map[string]int),
 		goroot: gr + "/src",
 	}
-	nid, perr := popNode(target, g)
+	nid, perr := populateNode(target, g)
 	if perr != nil {
 		log.Fatal(perr)
 	}
-	outf, err := os.OpenFile("tmp.dot", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	fmt.Printf("... creating DOT file %s\n", *dotoutflag)
+	outf, err := os.OpenFile(*dotoutflag, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -512,8 +576,7 @@ func main() {
 	if err := markCriticalPaths(g, nid, included); err != nil {
 		log.Fatal(err)
 	}
-	gt := g.transpose()
-	if err := gt.Write(outf, nidToId(g, included)); err != nil {
+	if err := g.Write(outf, nidToId(g, included)); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", g.String())
