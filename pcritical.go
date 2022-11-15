@@ -8,13 +8,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/thanm/grvutils/zgr"
 )
 
 // TODO/FIXME:
+// - add module path awareness (e.g. don't emit nodes not in main module)
 // - add package staleness check
 // - add build timings (might need to defeat build cache)
 // - do "go list" and package size calculations in parallel,
@@ -22,7 +25,7 @@ import (
 
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var glcacheflag = flag.String("glcache", "/tmp/.glcache", "cache dir for 'go list' invocations")
-var tgtflag = flag.String("tgt", "cmd/buildid", "target to analyze")
+var tgtflag = flag.String("tgt", "", "target to analyze")
 var dotoutflag = flag.String("dotout", "tmp.dot", "DOT file to emit")
 var nostdflag = flag.Bool("nostd", false, "Ignore stdlib package deps")
 
@@ -35,6 +38,17 @@ type Pkg struct {
 	Imports    []string
 }
 
+// Cache of "go list" results
+var listcache = make(map[string]*Pkg)
+
+// Cache of package sizes from gobuild
+var pkgsizecache = make(map[string]int)
+
+// For parallel pkg size computations
+var pkgsizewg sync.WaitGroup
+var pkgsizesema = make(chan struct{}, runtime.GOMAXPROCS(0))
+
+// hashes for use with disk cache
 var goroothash string
 var repohash string
 
@@ -126,13 +140,13 @@ func tryCache(dir string, tag string) ([]byte, bool, error) {
 	contents, err := os.ReadFile(cachePath(dir, tag))
 	if err != nil {
 		if os.IsNotExist(err) {
-			verb(2, "cache miss on %s", dir)
+			verb(3, "%s cache miss on %s", tag, dir)
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("problems reading cache %s: %v",
 			*glcacheflag, err)
 	}
-	verb(2, "%s cache hit on %s", tag, dir)
+	verb(3, "%s cache hit on %s", tag, dir)
 	return contents, true, nil
 }
 
@@ -145,7 +159,11 @@ func writeCache(dir, tag string, content []byte) error {
 }
 
 func goList(dir string) (*Pkg, error) {
-	// Try cache first
+	// Try mem cache first
+	if cpk, ok := listcache[dir]; ok {
+		return cpk, nil
+	}
+	// Try disk cache next
 	var pkg Pkg
 	out, valid, err := tryCache(dir, "list")
 	if err != nil {
@@ -156,6 +174,7 @@ func goList(dir string) (*Pkg, error) {
 		if err != nil {
 			return nil, err
 		}
+		listcache[dir] = pk
 		// write back to cache
 		if err := writeCache(dir, "list", out); err != nil {
 			return nil, fmt.Errorf("writing cache: %v", err)
@@ -166,6 +185,7 @@ func goList(dir string) (*Pkg, error) {
 	if err := json.Unmarshal(out, &pkg); err != nil {
 		return nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
 	}
+	listcache[dir] = &pkg
 	return &pkg, nil
 }
 
@@ -195,7 +215,11 @@ func (g *pgraph) nidPkgSize(nid string) int {
 }
 
 func pkgSize(dir, goroot string) (int, error) {
-	// Try cache first
+	// Try mem cache first
+	if v, ok := pkgsizecache[dir]; ok {
+		return v, nil
+	}
+	// Try disk cache next
 	out, valid, err := tryCache(dir, "build")
 	if err != nil {
 		return 0, err
@@ -216,6 +240,7 @@ func pkgSize(dir, goroot string) (int, error) {
 		sout := fmt.Sprintf("%d\n", fi.Size())
 		out = []byte(sout)
 		// write back to cache
+		pkgsizecache[dir] = int(fi.Size())
 		if err := writeCache(dir, "build", out); err != nil {
 			return 0, fmt.Errorf("writing cache: %v", err)
 		}
@@ -225,6 +250,8 @@ func pkgSize(dir, goroot string) (int, error) {
 	if n, err := fmt.Sscanf(string(out), "%d", &sz); err != nil || n != 1 {
 		return 0, fmt.Errorf("interpreting pksize %s: %v", string(out), err)
 	}
+	pkgsizecache[dir] = sz
+
 	return sz, nil
 }
 
@@ -316,7 +343,7 @@ func populateNode(tgt string, g *pgraph) (string, error) {
 		return snid, err
 	}
 	for _, dep := range pk.Imports {
-		if dep == "unsafe" {
+		if dep == "unsafe" || dep == "C" {
 			continue
 		}
 		if *nostdflag {
@@ -520,6 +547,9 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("pcritical: ")
 	flag.Parse()
+	if *tgtflag == "" {
+		usage("supply target with -tgt flag")
+	}
 
 	// Collect GOROOT as a first step.
 	gr, err := goRoot()
@@ -579,5 +609,5 @@ func main() {
 	if err := g.Write(outf, nidToId(g, included)); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Fprintf(os.Stderr, "%s\n", g.String())
+	verb(1, "graph:\n%s", g.String())
 }
