@@ -28,6 +28,7 @@ var glcacheflag = flag.String("glcache", "/tmp/.glcache", "cache dir for 'go lis
 var tgtflag = flag.String("tgt", "", "target to analyze")
 var dotoutflag = flag.String("dotout", "tmp.dot", "DOT file to emit")
 var nostdflag = flag.Bool("nostd", false, "Ignore stdlib package deps")
+var inunsflag = flag.Bool("include-unsafe", false, "include \"unsafe\" package")
 
 // Pkg holds results from "go list -json". There are many more
 // fields we could ask for, but at the moment we just need a few.
@@ -215,6 +216,10 @@ func (g *pgraph) nidPkgSize(nid string) int {
 }
 
 func pkgSize(dir, goroot string) (int, error) {
+	// special case for unsafe
+	if dir == "unsafe" {
+		return 1, nil
+	}
 	// Try mem cache first
 	if v, ok := pkgsizecache[dir]; ok {
 		return v, nil
@@ -343,7 +348,10 @@ func populateNode(tgt string, g *pgraph) (string, error) {
 		return snid, err
 	}
 	for _, dep := range pk.Imports {
-		if dep == "unsafe" || dep == "C" {
+		if !*inunsflag && dep == "" {
+			continue
+		}
+		if dep == "C" {
 			continue
 		}
 		if *nostdflag {
