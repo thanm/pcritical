@@ -17,11 +17,11 @@ import (
 )
 
 // TODO/FIXME:
+// - add subdir to cache based on glo
+// - run "go list" calculations for deps in parallel
 // - add module path awareness (e.g. don't emit nodes not in main module)
 // - add package staleness check
 // - add build timings (might need to defeat build cache)
-// - do "go list" and package size calculations in parallel,
-//   and/or deps in parallel
 
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var glcacheflag = flag.String("glcache", "/tmp/.glcache", "cache dir for 'go list' invocations")
@@ -42,12 +42,9 @@ type Pkg struct {
 // Cache of "go list" results
 var listcache = make(map[string]*Pkg)
 
-// Cache of package sizes from gobuild
+// Cache of package sizes from gobuild with associated mutex
+var pkgsizecachemu sync.Mutex
 var pkgsizecache = make(map[string]int)
-
-// For parallel pkg size computations
-var pkgsizewg sync.WaitGroup
-var pkgsizesema = make(chan struct{}, runtime.GOMAXPROCS(0))
 
 // hashes for use with disk cache
 var goroothash string
@@ -152,7 +149,7 @@ func tryCache(dir string, tag string) ([]byte, bool, error) {
 }
 
 func writeCache(dir, tag string, content []byte) error {
-	verb(2, "cache write for %s", dir)
+	verb(2, "%s cache write for %s", tag, dir)
 	if err := os.WriteFile(cachePath(dir, tag), content, 0777); err != nil {
 		return err
 	}
@@ -208,11 +205,14 @@ func goListUncached(tgt, dir string) (*Pkg, []byte, error) {
 	return &pkg, out, nil
 }
 
-func (g *pgraph) nidPkgSize(nid string) int {
+func (g *pgraph) nidPkgSize(nid string) (int, error) {
 	nlab := g.LookupNode(nid).Label()
 	pkg := nlab[1 : len(nlab)-1]
-	sz, _ := pkgSize(pkg, g.goroot)
-	return sz
+	if sz, err := pkgSize(pkg, g.goroot); err != nil {
+		return 0, err
+	} else {
+		return sz, nil
+	}
 }
 
 func pkgSize(dir, goroot string) (int, error) {
@@ -221,8 +221,11 @@ func pkgSize(dir, goroot string) (int, error) {
 		return 1, nil
 	}
 	// Try mem cache first
-	if v, ok := pkgsizecache[dir]; ok {
-		return v, nil
+	pkgsizecachemu.Lock()
+	cachedv, ok := pkgsizecache[dir]
+	pkgsizecachemu.Unlock()
+	if ok {
+		return cachedv, nil
 	}
 	// Try disk cache next
 	out, valid, err := tryCache(dir, "build")
@@ -238,24 +241,27 @@ func pkgSize(dir, goroot string) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("go build %s: %v", dir, err)
 		}
+		// inspect result
 		fi, err := os.Stat(outfile)
 		if err != nil {
 			return 0, fmt.Errorf("stat on %s: %v", outfile, err)
 		}
 		sout := fmt.Sprintf("%d\n", fi.Size())
 		out = []byte(sout)
-		// write back to cache
-		pkgsizecache[dir] = int(fi.Size())
+		// write back size to cache
 		if err := writeCache(dir, "build", out); err != nil {
 			return 0, fmt.Errorf("writing cache: %v", err)
 		}
+		os.Remove(outfile)
 	}
 	// unpack
 	var sz int
 	if n, err := fmt.Sscanf(string(out), "%d", &sz); err != nil || n != 1 {
 		return 0, fmt.Errorf("interpreting pksize %s: %v", string(out), err)
 	}
+	pkgsizecachemu.Lock()
 	pkgsizecache[dir] = sz
+	pkgsizecachemu.Unlock()
 
 	return sz, nil
 }
@@ -348,7 +354,7 @@ func populateNode(tgt string, g *pgraph) (string, error) {
 		return snid, err
 	}
 	for _, dep := range pk.Imports {
-		if !*inunsflag && dep == "" {
+		if !*inunsflag && dep == "unsafe" {
 			continue
 		}
 		if dep == "C" {
@@ -368,18 +374,59 @@ func populateNode(tgt string, g *pgraph) (string, error) {
 				return snid, err
 			}
 		}
-		verb(2, "grabbing pk size for %s", dep)
-		weight, err := pkgSize(dep, g.goroot)
-		if err != nil {
-			return "", err
-		}
-		ws := fmt.Sprintf("%d", weight)
-		attrs := map[string]string{
-			"label": ws,
-		}
-		g.AddEdge(snid, g.snid(dep), attrs)
+		g.AddEdge(snid, g.snid(dep), nil)
 	}
 	return snid, nil
+}
+
+func (g *pgraph) computeEdgeWeights(rootnid string) error {
+
+	verb(1, "starting pkg size computation root=%s", rootnid)
+	verb(2, "g.nodes: %+v", g.nodes)
+
+	// Compute package sizes.
+	var wg sync.WaitGroup
+	wg.Add(len(g.nodes))
+	sema := make(chan struct{}, runtime.GOMAXPROCS(0))
+	for pk := range g.nodes {
+		go func(pk string) {
+			sema <- struct{}{}
+			defer func() {
+				<-sema
+				wg.Done()
+			}()
+			pkgSize(pk, g.goroot)
+		}(pk)
+	}
+	wg.Wait()
+
+	verb(1, "finished pkg size computation, applying edge weights")
+
+	// Now use sizes for edge weights.
+	for pk := range g.nodes {
+		nid := g.snid(pk)
+		n := g.LookupNode(nid)
+		verb(2, "weight visit %s nid=%s", pk, nid)
+		edges := g.GetEdges(n)
+		for _, e := range edges {
+			edge := g.GetEdge(e)
+			src, sink := g.GetEndpoints(edge)
+			sinknode := g.GetNode(sink)
+			srcnode := g.GetNode(src)
+			verb(2, "compute weight for %s->%s p=%s",
+				srcnode.Id(), sinknode.Id(), sinknode.Label())
+			sz, err := g.nidPkgSize(sinknode.Id())
+			if err != nil {
+				return fmt.Errorf("bad size calc: %v", err)
+			}
+			ws := fmt.Sprintf("%d", sz)
+			attrs := map[string]string{
+				"label": ws,
+			}
+			g.SetEdgeAttrs(srcnode.Id(), sinknode.Id(), attrs)
+		}
+	}
+	return nil
 }
 
 func (g *pgraph) EdgeWeight(e *zgr.Edge) (int, error) {
@@ -455,7 +502,10 @@ func traceCritical(g *pgraph, rootnid string, nodes []string, included map[strin
 	verb(0, "\nCritical path:")
 	for i := range cp {
 		seg := cp[i]
-		sz := g.nidPkgSize(seg.nid)
+		sz, err := g.nidPkgSize(seg.nid)
+		if err != nil {
+			return err
+		}
 		pt := pathto[seg.nid]
 		verb(0, "%s [weight:%d pathto:%d]", seg.pkg, sz, pt)
 	}
@@ -473,7 +523,11 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 
 	pathto := make(map[string]int)
 	for _, nid := range listing {
-		pathto[nid] = g.nidPkgSize(nid)
+		var err error
+		pathto[nid], err = g.nidPkgSize(nid)
+		if err != nil {
+			return err
+		}
 	}
 	for k := range listing {
 		nid := listing[len(listing)-k-1]
@@ -488,7 +542,10 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 			srcnid := srcnode.Id()
 			verb(2, "consider edge %s -> %s",
 				g.GetNode(src).Label(), n.Label())
-			srcwt := g.nidPkgSize(srcnid)
+			srcwt, err := g.nidPkgSize(srcnid)
+			if err != nil {
+				return err
+			}
 			npt := toval + srcwt
 			if pathto[srcnid] < npt {
 				verb(2, "update pathto[%s] to %d (edge to %s)",
@@ -513,7 +570,10 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 	// Print for debugging
 	verb(1, "nodes with pathto values:")
 	for k, v := range nodes {
-		sz := g.nidPkgSize(v)
+		sz, err := g.nidPkgSize(v)
+		if err != nil {
+			return err
+		}
 		nlab := g.LookupNode(v).Label()
 		verb(1, "%d: %s sz=%d pt=%d %s", k, v, sz, pathto[v], nlab)
 	}
@@ -598,6 +658,9 @@ func main() {
 	}
 	nid, perr := populateNode(target, g)
 	if perr != nil {
+		log.Fatal(perr)
+	}
+	if err := g.computeEdgeWeights(nid); err != nil {
 		log.Fatal(perr)
 	}
 	fmt.Printf("... creating DOT file %s\n", *dotoutflag)
