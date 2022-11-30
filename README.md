@@ -26,5 +26,17 @@ Suppose that package build sizes/times are: { P=10, Q=11, R=11, T=29, S=3 }. In 
 
 On the other hand if instead { S = 99 }, then the critical path for P is { S => Q => P }.
 
+## Running pcritical
+
+To run the tool, supply a target package and the name of a DOT file to generate:
+
+```
+./pcritical -dotout me.dot -tgt github.com/thanm/pcritical 
+```
+
+May take a while to run, since it builds packages to see how large they are.
+
+
+
 
 
