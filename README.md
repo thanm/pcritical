@@ -36,7 +36,7 @@ To run the tool, supply a target package and the name of a DOT file to generate.
 
 which produces this graph:
 
-![dot diagram for pcritical](_images/self.svg)
+![dot diagram for pcritical](images/self.svg)
 
 May take a while to run, since it builds packages to see how large they are.
 
