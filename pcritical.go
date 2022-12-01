@@ -29,6 +29,7 @@ var tgtflag = flag.String("tgt", "", "target to analyze")
 var dotoutflag = flag.String("dotout", "tmp.dot", "DOT file to emit")
 var nostdflag = flag.Bool("nostd", false, "Ignore stdlib package deps")
 var inunsflag = flag.Bool("include-unsafe", false, "include \"unsafe\" package")
+var polylineflag = flag.Bool("polyline", false, "Add splines=polyline attribute to generated DOT graph")
 
 // Pkg holds results from "go list -json". There are many more
 // fields we could ask for, but at the moment we just need a few.
@@ -655,6 +656,10 @@ func main() {
 		Graph:  zgr.NewGraph(),
 		nodes:  make(map[string]int),
 		goroot: gr + "/src",
+	}
+	if *polylineflag {
+		pla := map[string]string{"splines": "polyline"}
+		g.SetAttrs(pla)
 	}
 	nid, perr := populateNode(target, g)
 	if perr != nil {

@@ -28,13 +28,19 @@ On the other hand if instead { S = 99 }, then the critical path for P is { S => 
 
 ## Running pcritical
 
-To run the tool, supply a target package and the name of a DOT file to generate:
+To run the tool, supply a target package and the name of a DOT file to generate. Here is an example of running pcritical on itself:
 
 ```
 ./pcritical -dotout me.dot -tgt github.com/thanm/pcritical 
 ```
 
+which produces this graph:
+
+![dot diagram for pcritical](_images/self.svg)
+
 May take a while to run, since it builds packages to see how large they are.
+
+
 
 
 

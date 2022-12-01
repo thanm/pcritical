@@ -15,7 +15,7 @@ func TestBasic(t *testing.T) {
 	exe := filepath.Join(tdir, "out.exe")
 	gotoolpath := filepath.Join(runtime.GOROOT(), "bin", "go")
 	cmd := exec.Command(gotoolpath, "build", "-o", exe, ".")
-	t.Logf("cmd: %+v\n", cmd)
+	//t.Logf("cmd: %+v\n", cmd)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("build: %s\n", b)
 		t.Fatalf("build error: %v", err)
@@ -23,8 +23,8 @@ func TestBasic(t *testing.T) {
 
 	// Run self on self.
 	dotp := filepath.Join(tdir, "out.dot")
-	cmd = exec.Command(exe, "-dotout="+dotp, "-tgt=github.com/thanm/pcritical")
-	t.Logf("cmd: %+v\n", cmd)
+	cmd = exec.Command(exe, "-polyline", "-dotout="+dotp, "-tgt=github.com/thanm/pcritical")
+	//t.Logf("cmd: %+v\n", cmd)
 	var output string
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("run: %s\n", b)
@@ -43,11 +43,15 @@ func TestBasic(t *testing.T) {
 			continue
 		}
 		if cap {
-			critpath = append(critpath, line)
+			if line == "" {
+				break
+			}
+			fs := strings.Fields(line)
+			critpath = append(critpath, fs[0])
 		}
 	}
 
-	t.Logf("cp: %+v\n", critpath)
+	//t.Logf("cp: %+v\n", critpath)
 	want0 := "github.com/thanm/pcritical"
 	if !strings.Contains(critpath[0], want0) {
 		t.Errorf("critpath[0] got %s want %s", critpath[0], want0)
