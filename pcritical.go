@@ -645,6 +645,7 @@ func main() {
 		// If pk root is the same as target root, we're analyzing something
 		// in the standard library, so repo hash is goroot hash.
 		repohash = goroothash
+		verb(2, "using goroothash as repohash")
 	} else {
 		// Collect separate hash from repo.
 		repohash = glo(pk.Root, false)
