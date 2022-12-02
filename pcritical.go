@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -537,14 +538,38 @@ func traceCritical(g *pgraph, rootnid string, nodes []string, included map[strin
 		cur = g.LookupNode(bestsucc).Id()
 	}
 
-	verb(0, "\nCritical path:")
+	var sb strings.Builder
+	if err := writeCP(&sb, cp, g); err != nil {
+		return err
+	}
+	cps := sb.String()
+
+	// Write CP to cache
+	root := cp[0].pkg
+	troot := root[1 : len(root)-1]
+	if err := writeCache(troot, "cpath", []byte(cps)); err != nil {
+
+		return err
+	}
+
+	// Also emit CP to stdout.
+	fmt.Printf("\nCritical path:%s\n", cps)
+
+	// Done
+	return nil
+}
+
+func writeCP(w io.Writer, cp []pathsegment, g *pgraph) error {
 	for i := range cp {
 		seg := cp[i]
 		pi, err := g.nidPkgSize(seg.nid)
 		if err != nil {
 			return err
 		}
-		verb(0, "%s [weight:%d nfuncs:%d]", seg.pkg, pi.sz, pi.nf)
+		if _, err := fmt.Fprintf(w, "%s [weight:%d nfuncs:%d]\n",
+			seg.pkg, pi.sz, pi.nf); err != nil {
+			return err
+		}
 	}
 	return nil
 }
