@@ -553,7 +553,7 @@ func traceCritical(g *pgraph, rootnid string, nodes []string, included map[strin
 	}
 
 	// Also emit CP to stdout.
-	fmt.Printf("\nCritical path:%s\n", cps)
+	fmt.Printf("\nCritical path:\n%s\n", cps)
 
 	// Done
 	return nil
