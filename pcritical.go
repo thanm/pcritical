@@ -42,6 +42,7 @@ type Pkg struct {
 }
 
 // Cache of "go list" results
+var listcachemu sync.Mutex
 var listcache = make(map[string]*Pkg)
 
 type pinfo struct {
@@ -165,7 +166,10 @@ func writeCache(dir, tag string, content []byte) error {
 
 func goList(dir string) (*Pkg, error) {
 	// Try mem cache first
-	if cpk, ok := listcache[dir]; ok {
+	listcachemu.Lock()
+	cpk, ok := listcache[dir]
+	listcachemu.Unlock()
+	if ok {
 		return cpk, nil
 	}
 	// Try disk cache next
@@ -190,7 +194,9 @@ func goList(dir string) (*Pkg, error) {
 	if err := json.Unmarshal(out, &pkg); err != nil {
 		return nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
 	}
+	listcachemu.Lock()
 	listcache[dir] = &pkg
+	listcachemu.Unlock()
 	return &pkg, nil
 }
 
@@ -387,26 +393,48 @@ func populateNode(tgt string, g *pgraph) (string, error) {
 	if err := g.MakeNode(snid, nodeAttr(tgt)); err != nil {
 		return snid, err
 	}
-	// add edges to deps
 	pk, err := goList(tgt)
 	if err != nil {
 		return snid, err
 	}
+	pskip := func(dep string) bool {
+		return (!*inunsflag && dep == "unsafe") ||
+			dep == "C"
+	}
+
+	// first loop to warm pk cache in parallel
+	var wg sync.WaitGroup
+	wg.Add(len(pk.Imports))
+	sema := make(chan struct{}, runtime.GOMAXPROCS(0))
+	verb(2, "processing %d deps in parallel for %s", len(pk.Imports), pk.ImportPath)
 	for _, dep := range pk.Imports {
-		if !*inunsflag && dep == "unsafe" {
+		if pskip(dep) {
+			wg.Done()
 			continue
 		}
-		if dep == "C" {
+		go func(pk string) {
+			sema <- struct{}{}
+			defer func() {
+				<-sema
+				wg.Done()
+			}()
+			goList(pk)
+		}(dep)
+	}
+	wg.Wait()
+	// second loop to actually build the graph
+	for _, dep := range pk.Imports {
+		if pskip(dep) {
 			continue
 		}
-		if *nostdflag {
-			pk, err := goList(dep)
-			if err != nil {
-				return snid, err
-			}
-			if pk.Standard {
-				continue
-			}
+		pk, err := goList(dep)
+		if err != nil {
+			return snid, err
+		}
+		if *nostdflag && pk.Standard {
+			// assumption is that stdlib packages will only
+			// depend on other stdlib packages.
+			continue
 		}
 		if _, ok := g.nodes[dep]; !ok {
 			if _, err := populateNode(dep, g); err != nil {
@@ -426,7 +454,7 @@ func (g *pgraph) computeEdgeWeights(rootnid string) error {
 	// Compute package sizes.
 	var wg sync.WaitGroup
 	wg.Add(len(g.nodes))
-	sema := make(chan struct{}, runtime.GOMAXPROCS(0))
+	sema := make(chan struct{}, runtime.GOMAXPROCS(0)/2)
 	for pk := range g.nodes {
 		go func(pk string) {
 			sema <- struct{}{}
