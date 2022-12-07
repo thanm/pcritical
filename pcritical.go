@@ -183,7 +183,9 @@ func goList(dir string) (*Pkg, error) {
 		if err != nil {
 			return nil, err
 		}
+		listcachemu.Lock()
 		listcache[dir] = pk
+		listcachemu.Unlock()
 		// write back to cache
 		if err := writeCache(dir, "list", out); err != nil {
 			return nil, fmt.Errorf("writing cache: %v", err)
