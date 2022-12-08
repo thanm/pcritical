@@ -41,8 +41,10 @@ which produces this graph:
 May take a while to run, since it builds packages to see how large they are.
 
 
+## Flags
 
+The `-nostd` flag tells pcritical to ignore packages that are part of the Go standard library. 
 
-
+The `-polyline` flag tells pcritical to emit DOT output with polyline edges as opposed to splines.
 
 
