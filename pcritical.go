@@ -18,11 +18,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/thanm/gocmdcache"
 	"github.com/thanm/grvutils/zgr"
 )
 
 // TODO/FIXME:
-// - add subdir to cache based on glo
 // - run "go list" calculations for deps in parallel
 // - add module path awareness (e.g. don't emit nodes not in main module)
 // - add package staleness check
@@ -36,31 +36,12 @@ var nostdflag = flag.Bool("nostd", false, "Ignore stdlib package deps")
 var inunsflag = flag.Bool("include-unsafe", false, "include \"unsafe\" package")
 var polylineflag = flag.Bool("polyline", false, "Add splines=polyline attribute to generated DOT graph")
 
-// Pkg holds results from "go list -json". There are many more
-// fields we could ask for, but at the moment we just need a few.
-type Pkg struct {
-	Standard   bool
-	ImportPath string
-	Root       string
-	Imports    []string
-}
-
-// Cache of "go list" results
-var listcachemu sync.Mutex
-var listcache = make(map[string]*Pkg)
-
-type pinfo struct {
-	sz int
-	nf int
-}
-
-// Cache of package sizes from gobuild with associated mutex
-var pkgsizecachemu sync.Mutex
-var pkgsizecache = make(map[string]pinfo)
-
 // hashes for use with disk cache
 var goroothash string
 var repohash string
+
+// cache
+var gcache *gocmdcache.Cache
 
 func glo(repo string, soft bool) string {
 	if soft {
@@ -80,243 +61,30 @@ func glo(repo string, soft bool) string {
 	return strings.TrimSpace(string(out))
 }
 
-const glopath = "=glo="
-
-func initCache() error {
-	p := filepath.Join(*glcacheflag, glopath)
-	outf, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+func goListUncached(tgt string) (*gocmdcache.Pkg, error) {
+	// run "go list"
+	cmd := exec.Command("go", "list", "-json", tgt)
+	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("opening %s: %v", p, err)
-	}
-	if _, err := fmt.Fprintf(outf, "%s %s\n", repohash, goroothash); err != nil {
-		return fmt.Errorf("writing %s: %v", p, err)
-	}
-	if err := outf.Close(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func cacheValid() (bool, error) {
-	p := filepath.Join(*glcacheflag, glopath)
-	contents, err := os.ReadFile(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		} else {
-			return false, err
-		}
-	}
-	val := strings.TrimSpace(string(contents))
-	want := repohash + " " + goroothash
-	if val != want {
-		verb(2, "cache mismatch:\ngot %q\nwant %q\n", val, want)
-		if err := os.RemoveAll(*glcacheflag); err != nil {
-			return false, err
-		}
-		if err := os.Mkdir(*glcacheflag, 0777); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	return true, nil
-}
-
-func cachePath(dir string, tag string) string {
-	dtag := strings.ReplaceAll(dir, "/", "%")
-	return filepath.Join(*glcacheflag, dtag+"."+tag)
-}
-
-func tryCache(dir string, tag string) ([]byte, bool, error) {
-	err := os.Mkdir(*glcacheflag, 0777)
-	needsinit := false
-	if err == nil {
-		needsinit = true
-	} else if !os.IsExist(err) {
-		return nil, false, fmt.Errorf("unable to create cache %s: %v",
-			*glcacheflag, err)
-	}
-	if isvalid, err := cacheValid(); err != nil {
-		return nil, false, fmt.Errorf("problems reading cache %s: %v",
-			*glcacheflag, err)
-	} else if !isvalid {
-		needsinit = true
-	}
-	if needsinit {
-		if err = initCache(); err != nil {
-			return nil, false, err
-		}
-	}
-	contents, err := os.ReadFile(cachePath(dir, tag))
-	if err != nil {
-		if os.IsNotExist(err) {
-			verb(3, "%s cache miss on %s", tag, dir)
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("problems reading cache %s: %v",
-			*glcacheflag, err)
-	}
-	verb(3, "%s cache hit on %s", tag, dir)
-	return contents, true, nil
-}
-
-func writeCache(dir, tag string, content []byte) error {
-	verb(2, "%s cache write for %s", tag, dir)
-	if err := os.WriteFile(cachePath(dir, tag), content, 0777); err != nil {
-		return err
-	}
-	return nil
-}
-
-func goList(dir string) (*Pkg, error) {
-	// Try mem cache first
-	listcachemu.Lock()
-	cpk, ok := listcache[dir]
-	listcachemu.Unlock()
-	if ok {
-		return cpk, nil
-	}
-	// Try disk cache next
-	var pkg Pkg
-	out, valid, err := tryCache(dir, "list")
-	if err != nil {
-		return nil, err
-	} else if !valid {
-		// cache miss, run "go list"
-		pk, out, err := goListUncached(dir, "")
-		if err != nil {
-			return nil, err
-		}
-		listcachemu.Lock()
-		listcache[dir] = pk
-		listcachemu.Unlock()
-		// write back to cache
-		if err := writeCache(dir, "list", out); err != nil {
-			return nil, fmt.Errorf("writing cache: %v", err)
-		}
-		return pk, nil
+		return nil, fmt.Errorf("go list -json %s: %v", tgt, err)
 	}
 	// unpack
+	var pkg gocmdcache.Pkg
 	if err := json.Unmarshal(out, &pkg); err != nil {
-		return nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
+		return nil, fmt.Errorf("go list -json %s: unmarshal: %v", tgt, err)
 	}
-	listcachemu.Lock()
-	listcache[dir] = &pkg
-	listcachemu.Unlock()
 	return &pkg, nil
 }
 
-func goListUncached(tgt, dir string) (*Pkg, []byte, error) {
-	// run "go list"
-	cmd := exec.Command("go", "list", "-json", tgt)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, nil, fmt.Errorf("go list -json %s: %v", dir, err)
-	}
-	// unpack
-	var pkg Pkg
-	if err := json.Unmarshal(out, &pkg); err != nil {
-		return nil, nil, fmt.Errorf("go list -json %s: unmarshal: %v", dir, err)
-	}
-	return &pkg, out, nil
+func goList(dir string) (*gocmdcache.Pkg, error) {
+	return gcache.GoList(dir)
 }
 
-func (g *pgraph) nidPkgSize(nid string) (pinfo, error) {
+func (g *pgraph) nidPkgSize(nid string) (gocmdcache.PkgInfo, error) {
 	nlab := g.LookupNode(nid).Label()
 	pkg := nlab[1 : len(nlab)-1]
-	if pi, err := pkgSize(pkg, g.goroot); err != nil {
-		return pinfo{}, err
-	} else {
-		return pi, nil
-	}
+	return gcache.PkgSize(pkg)
 }
-
-// computePkgInfo given a compiled package file 'apath' returns
-// a string of the form "N M" where N is the compiled package file
-// size, and M is the estimated number of functions it contains.
-func computePkgInfo(apath string) (string, error) {
-	// compute file size
-	fi, ferr := os.Stat(apath)
-	if ferr != nil {
-		return "", fmt.Errorf("stat on %s: %v", apath, ferr)
-	}
-	// compute func count estimate
-	cmd := exec.Command("go", "tool", "nm", apath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("go tool nm %s: %v", apath, err)
-	}
-	lines := strings.Split(string(out), "\n")
-	totf := 0
-	for _, line := range lines {
-		m := strings.Fields(line)
-		if len(m) == 3 && m[1] == "T" {
-			totf++
-			continue
-		}
-		if len(m) == 4 && m[2] == "T" {
-			totf++
-			continue
-		}
-	}
-	return fmt.Sprintf("%d %d\n", fi.Size(), totf), nil
-}
-
-func pkgSize(dir, goroot string) (pinfo, error) {
-	// special case for unsafe
-	if dir == "unsafe" {
-		return pinfo{sz: 1, nf: 0}, nil
-	}
-	// Try mem cache first
-	pkgsizecachemu.Lock()
-	cachedv, ok := pkgsizecache[dir]
-	pkgsizecachemu.Unlock()
-	if ok {
-		return cachedv, nil
-	}
-	// Try disk cache next
-	out, valid, err := tryCache(dir, "build")
-	if err != nil {
-		return pinfo{}, err
-	} else if !valid {
-		// cache miss, run "go build"
-		outfile := cachePath(dir, "archive")
-		os.RemoveAll(outfile)
-		verb(2, "build cmd is 'go build -o %s %s", outfile, dir)
-		cmd := exec.Command("go", "build", "-o", outfile, dir)
-		out, err = cmd.CombinedOutput()
-		if err != nil {
-			return pinfo{}, fmt.Errorf("go build %s: %v", dir, err)
-		}
-		payload, perr := computePkgInfo(outfile)
-		if perr != nil {
-
-			return pinfo{}, perr
-		}
-		out = []byte(payload)
-		// write back size to cache
-		if err := writeCache(dir, "build", out); err != nil {
-			return pinfo{}, fmt.Errorf("writing cache: %v", err)
-		}
-		os.Remove(outfile)
-	}
-	// unpack
-	var sz int
-	var nf int
-	if n, err := fmt.Sscanf(string(out), "%d %d", &sz, &nf); err != nil || n != 2 {
-		return pinfo{}, fmt.Errorf("interpreting pksize %s: %v", string(out), err)
-	}
-	pi := pinfo{sz: sz, nf: nf}
-	pkgsizecachemu.Lock()
-	pkgsizecache[dir] = pi
-	pkgsizecachemu.Unlock()
-
-	return pi, nil
-}
-
 func goRoot() (string, error) {
 	cmd := exec.Command("go", "env", "GOROOT")
 	out, err := cmd.Output()
@@ -468,7 +236,7 @@ func (g *pgraph) computeEdgeWeights(rootnid string) error {
 				<-sema
 				wg.Done()
 			}()
-			pkgSize(pk, g.goroot)
+			gcache.PkgSize(pk)
 		}(pk)
 	}
 	wg.Wait()
@@ -492,7 +260,7 @@ func (g *pgraph) computeEdgeWeights(rootnid string) error {
 			if err != nil {
 				return fmt.Errorf("bad size calc: %v", err)
 			}
-			ws := fmt.Sprintf("%d", pi.sz)
+			ws := fmt.Sprintf("%d", pi.Size)
 			attrs := map[string]string{
 				"label": ws,
 			}
@@ -581,7 +349,7 @@ func traceCritical(g *pgraph, rootnid string, nodes []string, included map[strin
 	// Write CP to cache
 	root := cp[0].pkg
 	troot := root[1 : len(root)-1]
-	if err := writeCache(troot, "cpath", []byte(cps)); err != nil {
+	if err := gcache.WriteCache(troot, "cpath", []byte(cps)); err != nil {
 
 		return err
 	}
@@ -601,7 +369,7 @@ func writeCP(w io.Writer, cp []pathsegment, g *pgraph) error {
 			return err
 		}
 		if _, err := fmt.Fprintf(w, "%s [weight:%d nfuncs:%d]\n",
-			seg.pkg, pi.sz, pi.nf); err != nil {
+			seg.pkg, pi.Size, pi.NumFuncs); err != nil {
 			return err
 		}
 	}
@@ -624,7 +392,7 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 		if err != nil {
 			return err
 		}
-		pathto[nid] = pi.sz
+		pathto[nid] = pi.Size
 	}
 	for k := range listing {
 		nid := listing[len(listing)-k-1]
@@ -643,7 +411,7 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 			if err != nil {
 				return err
 			}
-			srcwt := pi.sz
+			srcwt := pi.Size
 			npt := toval + srcwt
 			if pathto[srcnid] < npt {
 				verb(2, "update pathto[%s] to %d (edge to %s)",
@@ -674,7 +442,7 @@ func markCriticalPaths(g *pgraph, nid string, included map[string]bool) error {
 		}
 		nlab := g.LookupNode(v).Label()
 		verb(1, "%d: %s sz=%d nf=%d pt=%d %s",
-			k, v, pi.sz, pi.nf, pathto[v], nlab)
+			k, v, pi.Size, pi.NumFuncs, pathto[v], nlab)
 	}
 
 	// trace critical path
@@ -725,11 +493,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Run "go list" on the target without any caching, just so that
-	// we can establish some basics.
+	// Run "go list" on the target to establish some basics.
 	target := *tgtflag
 	verb(1, "target is: %s", *tgtflag)
-	pk, _, err := goListUncached(target, "")
+	pk, err := goListUncached(target)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -748,6 +515,12 @@ func main() {
 		// Collect separate hash from repo.
 		repohash = glo(pk.Root, false)
 		verb(2, "repohash: %s", repohash)
+	}
+
+	// Create cache
+	gcache, err = gocmdcache.Make(repohash, goroothash, *glcacheflag, *verbflag)
+	if err != nil {
+		log.Fatalf("error creating cache: %v", err)
 	}
 
 	// Construct dependency graph.

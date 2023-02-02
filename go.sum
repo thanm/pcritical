@@ -1,2 +1,4 @@
+github.com/thanm/gocmdcache v0.0.2 h1:1UI3g0Qd4mg2X7qZD+/PBUFDnNppyVOEXBGxA8iqTGQ=
+github.com/thanm/gocmdcache v0.0.2/go.mod h1:b760qxKgHld121hG8SW4oMvKo3LOjOkxhcEiWrEEUiQ=
 github.com/thanm/grvutils v1.0.3 h1:7kOCz4AacOQINabpO1WGGEhS0suS0sJUHYVLbxNa1QM=
 github.com/thanm/grvutils v1.0.3/go.mod h1:K0y/QDwSn/UL5EyrihKx6bzL/z19Sj7UPCbJ9xWoMPE=
