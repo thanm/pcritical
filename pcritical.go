@@ -108,14 +108,6 @@ type pgraph struct {
 	goroot string
 }
 
-func (g *pgraph) transpose() *pgraph {
-	return &pgraph{
-		Graph:  g.Transpose(),
-		nodes:  g.nodes,
-		goroot: g.goroot,
-	}
-}
-
 func tsvisit(g *pgraph, snid string, visited map[string]bool) {
 	if visited[snid] {
 		return
