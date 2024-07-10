@@ -461,6 +461,7 @@ func verb(vlevel int, s string, a ...interface{}) {
 		fmt.Printf("\n")
 	}
 }
+
 func usage(msg string) {
 	if len(msg) > 0 {
 		fmt.Fprintf(os.Stderr, "error: %s\n", msg)

@@ -1,6 +1,6 @@
 module github.com/thanm/pcritical
 
-go 1.20
+go 1.21
 
 require (
 	github.com/thanm/gocmdcache v0.0.2
